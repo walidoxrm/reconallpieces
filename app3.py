@@ -3,16 +3,22 @@
 """
 App Streamlit : contrôle des demandes de retour (RetourenPrint) vs factures (FakturenPrint)
 
-Modifs :
-- Déduplication par contenu lors de l'upload (après extraction du texte via PyMuPDF) :
-  * On normalise le texte, on calcule un hash ; si déjà vu, on ignore le fichier comme doublon.
-  * Un panneau "Doublons ignorés" liste les fichiers écartés et leur original conservé.
-- OCR désactivé par défaut (recommandé pour Streamlit Community Cloud). Réactivable via la sidebar.
+Tâches :
+1) RetourenPrint.pdf : extraire "N° de retour fournisseur : <num>" et compter le nombre de lignes
+   = plus longue suite consécutive 1..k trouvée dans le tableau après "Lig. no .".
+2) FakturenPrint.pdf : compter les lignes contenant "Retournummer : <num>" (par numéro).
+3) Tableau :
+   n° retour | fichier demande | nbre lignes (demande) | fichier(s) facture | nbre lignes sur facture | représentation (x / y) | statut
 
-Tâches d'analyse inchangées :
-1) RetourenPrint.pdf : extraire "N° de retour fournisseur : <num>" et compter la plus longue suite 1..k
-2) FakturenPrint.pdf : compter "Retournummer : <num>" par numéro
-3) Rendu tabulaire + export CSV
+Dépendances :
+  streamlit==1.37.0
+  pymupdf==1.24.8
+  pdf2image==1.17.0
+  pytesseract==0.3.10
+  Pillow==10.4.0
+
+Exécution :
+  streamlit run app.py
 """
 
 from __future__ import annotations
@@ -20,9 +26,8 @@ from __future__ import annotations
 import io
 import re
 import csv
-import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import streamlit as st
 
@@ -50,38 +55,30 @@ INVOICE_RET_NO_RE = re.compile(
     r"""Retournummer\s*:\s*(\d{5,})""", re.IGNORECASE
 )
 LIG_HEADER_RE = re.compile(r"""Lig\.\s*no\s*\.""", re.IGNORECASE)
+
+# Numéro de ligne au début d’une ligne (table), ex: "  12  "
 LEADING_ROW_NUM_RE = re.compile(r"""^\s*(\d{1,6})\s""", re.MULTILINE)
 
-# =========================
-# Types
-# =========================
+
 @dataclass
 class RetourRequest:
     file_name: str
     supplier_return_no: str
     lines_count: int
-    debug_numbers_found: List[int]
+    debug_numbers_found: List[int]  # pour vérifier ce qui a été capté
+
 
 @dataclass
 class InvoiceScan:
     file_name: str
     counts_by_return_no: Dict[str, int]
 
+
 # =========================
-# Utils
+# Utilitaires
 # =========================
-def normalize_text(s: str) -> str:
-    """Normalisation agressive pour la déduplication (insensible aux espaces/casse)."""
-    return " ".join(s.split()).lower()
-
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
 @st.cache_data(show_spinner=False)
-def read_pdf_text(file_bytes: bytes, use_ocr_if_needed: bool = False) -> str:
+def read_pdf_text(file_bytes: bytes, use_ocr_if_needed: bool = True) -> str:
     """Lit le texte d'un PDF (PyMuPDF d'abord ; fallback OCR si page quasi vide)."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     all_text_parts: List[str] = []
@@ -94,6 +91,7 @@ def read_pdf_text(file_bytes: bytes, use_ocr_if_needed: bool = False) -> str:
 
     for page in doc:
         text = page.get_text("text") or ""
+        # Si très peu de texte et OCR dispo, tenter OCR
         if use_ocr_if_needed and OCR_AVAILABLE and len(text.strip()) < 20:
             try:
                 pix = page.get_pixmap(dpi=300)
@@ -104,6 +102,7 @@ def read_pdf_text(file_bytes: bytes, use_ocr_if_needed: bool = False) -> str:
                 except Exception:
                     pass
             except Exception:
+                # Tentative via pdf2image sur la page courante
                 if convert_from_bytes is not None:
                     try:
                         images = convert_from_bytes(
@@ -119,23 +118,32 @@ def read_pdf_text(file_bytes: bytes, use_ocr_if_needed: bool = False) -> str:
                                 pass
                     except Exception:
                         pass
+
         all_text_parts.append(text)
 
     return "\n".join(all_text_parts)
 
+
 def longest_consecutive_from_one(nums: List[int]) -> int:
+    """
+    Retourne le plus grand k tel que {1,2,...,k} ⊆ nums.
+    Robuste si d'autres nombres (hors suite) sont présents dans le texte.
+    """
     s = set(n for n in nums if 1 <= n <= 1_000_000)
     k = 0
     while (k + 1) in s:
         k += 1
     return k
 
+
 def parse_retour_request(text: str, file_name: str) -> RetourRequest:
+    """Extrait le n° de retour fournisseur et le nombre de lignes depuis un 'RetourenPrint'."""
     m = SUPPLIER_RET_NO_RE.search(text)
     if not m:
         raise ValueError(f"{file_name}: N° de retour fournisseur introuvable.")
     ret_no = m.group(1)
 
+    # On cible la zone du tableau après l'en-tête 'Lig. no .'
     hm = LIG_HEADER_RE.search(text)
     sub = text if not hm else text[hm.end():]
 
@@ -146,15 +154,18 @@ def parse_retour_request(text: str, file_name: str) -> RetourRequest:
         file_name=file_name,
         supplier_return_no=ret_no,
         lines_count=lines_count,
-        debug_numbers_found=numbers_found[:50],
+        debug_numbers_found=numbers_found[:50],  # pour inspection
     )
 
+
 def scan_invoice_counts(text: str, file_name: str) -> InvoiceScan:
+    """Parcourt un 'FakturenPrint' et compte les 'Retournummer : <no>' (par numéro)."""
     numbers = INVOICE_RET_NO_RE.findall(text)
     counts: Dict[str, int] = {}
     for n in numbers:
         counts[n] = counts.get(n, 0) + 1
     return InvoiceScan(file_name=file_name, counts_by_return_no=counts)
+
 
 def rows_to_csv(rows: List[dict], fieldnames: List[str]) -> bytes:
     buf = io.StringIO()
@@ -164,48 +175,6 @@ def rows_to_csv(rows: List[dict], fieldnames: List[str]) -> bytes:
         writer.writerow(r)
     return buf.getvalue().encode("utf-8")
 
-# =========================
-# Déduplication par contenu (en mémoire, à l'upload)
-# =========================
-def dedupe_uploaded_files(files: List[st.runtime.uploaded_file_manager.UploadedFile],
-                          use_ocr_if_needed: bool,
-                          label: str) -> Tuple[List[Tuple[str, bytes, str]], List[Tuple[str, str]]]:
-    """
-    Retourne:
-      - kept: liste de tuples (file_name, file_bytes, text_hash)
-      - dups:  liste de tuples (dup_name, kept_name) pour affichage
-    """
-    kept: List[Tuple[str, bytes, str]] = []
-    dups: List[Tuple[str, str]] = []
-    seen_by_hash: Dict[str, str] = {}
-
-    for up in files:
-        # Récup bytes
-        try:
-            raw = up.getvalue()
-        except Exception:
-            raw = up.read()
-
-        # Extrait + normalise texte -> hash
-        text = read_pdf_text(raw, use_ocr_if_needed=use_ocr_if_needed)
-        text_norm = normalize_text(text)
-        t_hash = sha256_text(text_norm) if text_norm else sha256_bytes(raw)  # fallback au hash binaire si pas de texte
-
-        # Dédup
-        if t_hash in seen_by_hash:
-            dups.append((up.name, seen_by_hash[t_hash]))
-            continue
-
-        seen_by_hash[t_hash] = up.name
-        kept.append((up.name, raw, t_hash))
-
-    # Feedback UI
-    if dups:
-        with st.expander(f"🧹 Doublons ignorés ({label})", expanded=False):
-            for dup_name, kept_name in dups:
-                st.warning(f"⛔ **{dup_name}** ignoré (contenu identique à **{kept_name}**).")
-
-    return kept, dups
 
 # =========================
 # UI
@@ -216,9 +185,7 @@ st.caption("Chargez plusieurs **demandes de retour** (RetourenPrint*.pdf) et plu
 
 with st.sidebar:
     st.subheader("Options")
-    # Par défaut désactivé (idéal Streamlit Community Cloud)
-    use_ocr = st.checkbox("Activer le fallback OCR si nécessaire", value=False,
-                          help="Utile uniquement pour les PDF scannés (nécessite Tesseract hors Streamlit Cloud).")
+    use_ocr = st.checkbox("Activer le fallback OCR si nécessaire", value=True, help="Utile pour les PDF scannés.")
     if OCR_AVAILABLE:
         st.text_input(
             "Chemin de l'exécutable Tesseract (optionnel)",
@@ -246,31 +213,28 @@ if retour_files and invoice_files:
     st.divider()
     st.subheader("Résultats")
 
-    # === Déduplication côté demandes ===
-    kept_retours, _dups_r = dedupe_uploaded_files(retour_files, use_ocr, "demandes")
-    # === Déduplication côté factures ===
-    kept_invoices, _dups_f = dedupe_uploaded_files(invoice_files, use_ocr, "factures")
-
     # 1) Parse demandes de retour
     retour_list: List[RetourRequest] = []
     retour_errors: List[str] = []
-    for name, raw, _h in kept_retours:
+    for up in retour_files:
         try:
-            text = read_pdf_text(raw, use_ocr_if_needed=use_ocr)
-            retour = parse_retour_request(text, name)
+            data = up.read()
+            text = read_pdf_text(data, use_ocr_if_needed=use_ocr)
+            retour = parse_retour_request(text, up.name)
             retour_list.append(retour)
         except Exception as e:
-            retour_errors.append(f"{name} ➜ {e}")
+            retour_errors.append(f"{up.name} ➜ {e}")
 
-    # 2) Parse factures
+    # 2) Parse factures (compteurs par 'Retournummer')
     invoice_scans: List[InvoiceScan] = []
-    for name, raw, _h in kept_invoices:
+    for up in invoice_files:
         try:
-            text = read_pdf_text(raw, use_ocr_if_needed=use_ocr)
-            scan = scan_invoice_counts(text, name)
+            data = up.read()
+            text = read_pdf_text(data, use_ocr_if_needed=use_ocr)
+            scan = scan_invoice_counts(text, up.name)
             invoice_scans.append(scan)
         except Exception as e:
-            st.error(f"{name} ➜ Erreur lecture facture: {e}")
+            st.error(f"{up.name} ➜ Erreur lecture facture: {e}")
 
     # Indexation: ret_no -> {file_name: count}
     index_counts: Dict[str, Dict[str, int]] = {}
@@ -286,8 +250,10 @@ if retour_files and invoice_files:
         files_with_counts = [f"{fn} ({cnt})" for fn, cnt in sorted(by_file.items()) if cnt > 0]
         total_on_invoices = sum(by_file.values()) if by_file else 0
 
+        # Représentation du ratio : "x / y"
         display_ratio = f"{total_on_invoices} / {r.lines_count}"
 
+        # Statut lisible
         if r.lines_count == 0:
             badge = "❌ 0/0"
         elif total_on_invoices == r.lines_count:
@@ -303,11 +269,11 @@ if retour_files and invoice_files:
             "Nbre lignes (demande)": r.lines_count,
             "Fichier(s) facture correspondant(s)": ", ".join(files_with_counts) if files_with_counts else "—",
             "Nbre lignes sur facture": total_on_invoices,
-            "Représentation": display_ratio,
+            "Représentation": display_ratio,  # <= "x / y"
             "Statut": badge,
         })
 
-    # Affichage résultats
+    # Affichage
     if rows:
         column_order = [
             "N° retour",
@@ -325,6 +291,7 @@ if retour_files and invoice_files:
             use_container_width=True,
             disabled=True,
         )
+
         # Export CSV
         csv_bytes = rows_to_csv(rows, fieldnames=column_order)
         st.download_button(
@@ -334,7 +301,7 @@ if retour_files and invoice_files:
             mime="text/csv",
         )
     else:
-        st.info("Aucune correspondance trouvée (ou seulement des doublons ont été fournis).")
+        st.info("Aucune correspondance trouvée.")
 
     # Debug
     with st.expander("🔍 Détails demandes de retour (debug)", expanded=False):
